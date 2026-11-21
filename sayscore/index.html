@@ -1,0 +1,484 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="theme-color" content="#000000">
+<meta name="color-scheme" content="dark">
+<title>Numbers</title>
+<link rel="icon" href="data:,">
+<!-- Roboto Condensed: the Android/Wear OS system condensed face. Loaded from Google Fonts
+     when online; Android falls back to its built-in copy via "sans-serif-condensed". -->
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Roboto+Condensed:wght@500;700&display=swap" rel="stylesheet">
+<style>
+  :root { --font: "Roboto Condensed", sans-serif-condensed, "Arial Narrow", system-ui, sans-serif; }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body {
+    margin: 0; height: 100%; background: #000; color: #fff; overflow: hidden;
+    -webkit-user-select: none; user-select: none; touch-action: manipulation;
+    font-family: var(--font); font-variant-numeric: tabular-nums;
+  }
+  /* A square sized to the short side of the screen, centred. Everything inside is laid out in
+     vmin so it scales to any watch and stays inside the round display. */
+  #face { position: fixed; left: 50%; top: 50%; width: 100vmin; height: 100vmin; transform: translate(-50%, -50%); }
+  #rows {
+    position: absolute; left: 0; right: 0; top: 10vmin; height: 55vmin;
+    display: flex; flex-direction: column; justify-content: flex-end; align-items: center;
+  }
+  .row {
+    white-space: nowrap; line-height: 1.08; font-weight: 500;
+    transition: font-size .32s ease, opacity .32s ease, color .32s ease;
+  }
+  .row.l0 { color: #8c8c8c; }               /* oldest, top, smallest */
+  .row.l1 { color: #c8c8c8; }               /* middle */
+  .row.l2 { color: #fff; font-weight: 700; } /* main row, bottom, largest */
+  .row.gone { opacity: 0; }
+  .sep { color: #707070; padding: 0 .04em; }
+  .n { display: inline-block; }
+  .n.new { animation: pop .28s ease-out; }
+  @keyframes pop { from { opacity: 0; transform: translateY(.25em); } to { opacity: 1; transform: none; } }
+  #status {  /* only shows text while loading or when something is wrong */
+    position: absolute; left: 12vmin; right: 12vmin; bottom: calc(10vmin + max(17vmin, 40px));
+    text-align: center; font-size: 5vmin; line-height: 1.15; color: #ffb74d;
+  }
+  #btn {
+    position: absolute; left: 50%; bottom: 8vmin; transform: translateX(-50%);
+    width: 46vmin; height: 17vmin; min-height: 40px; border: 0; border-radius: 999px;
+    font: 700 7.5vmin/1 var(--font); letter-spacing: .02em; color: #000; background: #00c853; cursor: pointer;
+  }
+  #btn.stop { background: #ff5252; }
+  #btn.busy { background: #3a3a3a; color: #fff; font-size: 6.2vmin; white-space: nowrap; }
+  #btn:active { filter: brightness(.85); }
+  #measure { position: absolute; left: -9999px; top: 0; visibility: hidden; white-space: nowrap; line-height: 1.08; }
+</style>
+</head>
+<body>
+<div id="face">
+  <div id="rows" aria-live="polite"></div>
+  <div id="status" role="status"></div>
+  <button id="btn" type="button">Start</button>
+</div>
+<span id="measure" aria-hidden="true"></span>
+
+<script>
+(() => {
+'use strict';
+
+// ---------------------------------------------------------------- settings
+const CONFIG = {
+  perRow: 3,          // numbers per row
+  rows: 3,            // rows on screen
+  lang: 'en-US',
+  // On-device engine (used when the browser has no built-in speech recognition).
+  voskLib: ['https://cdn.jsdelivr.net/npm/vosk-browser@0.0.8/dist/vosk.js', 'vosk.js'],
+  modelFile: 'vosk-model-small-en-us-0.15.tar.gz',   // optional copy next to this page
+  modelFallback: 'https://ccoreilly.github.io/vosk-browser/models/vosk-model-small-en-us-0.15.tar.gz',
+  pauseSplit: 0.1,    // seconds of silence between words that starts a new number
+};
+const SIZES = [9.5, 12.5, 20];  // font size in vmin: top, middle, main
+const MAXW  = [74, 84, 90];     // widest a row may be in vmin before it is scaled down
+
+const NUMBER_WORDS = ('zero one two three four five six seven eight nine ten eleven twelve thirteen ' +
+  'fourteen fifteen sixteen seventeen eighteen nineteen twenty thirty forty fifty sixty seventy ' +
+  'eighty ninety hundred thousand').split(' ');
+const GRAMMAR = JSON.stringify(NUMBER_WORDS.concat('[unk]'));
+
+// ---------------------------------------------------------------- number parsing
+const UNITS = { zero: 0, one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8, nine: 9 };
+const TEENS = { ten: 10, eleven: 11, twelve: 12, thirteen: 13, fourteen: 14, fifteen: 15,
+                sixteen: 16, seventeen: 17, eighteen: 18, nineteen: 19 };
+const TENS  = { twenty: 20, thirty: 30, forty: 40, fourty: 40, fifty: 50, sixty: 60,
+                seventy: 70, eighty: 80, ninety: 90 };
+// Words speech engines commonly return in place of a lone digit.
+const ALIAS = { to: 'two', too: 'two', for: 'four', won: 'one', ate: 'eight', nought: 'zero' };
+
+// "five twelve seven" -> [5, 12, 7]; "twenty five" -> [25]; "one hundred and six" -> [106];
+// "5:12 7" -> [5, 12, 7]. Anything that is not a number word acts as a separator.
+function parseNumbers(text) {
+  const out = [];
+  const s = String(text || '').toLowerCase().replace(/(\d),(?=\d{3}(\D|$))/g, '$1');
+  const tokens = s.match(/\d+|[a-z]+|[,.;:!?]/g) || [];  // punctuation = a pause = separator
+  let cur = null; // { total, group, last }
+  const flush = () => { if (cur) { out.push(cur.total + cur.group); cur = null; } };
+  const start = (group, last, total) => { flush(); cur = { total: total || 0, group, last }; };
+  for (let t of tokens) {
+    if (/^\d/.test(t)) { flush(); out.push(parseInt(t, 10)); continue; }
+    t = ALIAS[t] || t;
+    const afterScale = cur && (cur.last === 'hundred' || cur.last === 'thousand');
+    if (t in UNITS) {
+      const v = UNITS[t];
+      if (v && cur && cur.last === 'tens') { cur.group += v; cur.last = 'unit'; cur.tensUnit = true; }  // twenty five
+      else if (v && afterScale) { cur.group += v; cur.last = 'unit'; }                                    // hundred (and) six
+      else start(v, 'unit');
+    } else if (t in TEENS) {
+      if (afterScale) { cur.group += TEENS[t]; cur.last = 'teen'; } else start(TEENS[t], 'teen');
+    } else if (t in TENS) {
+      if (afterScale) { cur.group += TENS[t]; cur.last = 'tens'; } else start(TENS[t], 'tens');
+    } else if (t === 'hundred') {
+      if (cur && cur.last === 'unit' && cur.tensUnit) {
+        // "sixty one hundred twenty" in a list is 60, 120 rather than 6,120
+        const unit = cur.group % 10;
+        cur.group -= unit; flush(); start(unit * 100, 'hundred');
+      } else if (cur && cur.last !== 'hundred' && cur.group > 0 && cur.group < 100) {
+        cur.group *= 100; cur.last = 'hundred';
+      } else start(100, 'hundred');
+    } else if (t === 'thousand') {
+      if (cur && cur.last !== 'thousand' && cur.total === 0 && cur.group > 0) {
+        cur.total = cur.group * 1000; cur.group = 0; cur.last = 'thousand';
+      } else start(0, 'thousand', 1000);
+    } else if (t === 'and' && afterScale) {
+      // "one hundred and six": keep building the same number
+    } else {
+      flush();
+    }
+  }
+  flush();
+  return out;
+}
+
+// ---------------------------------------------------------------- display
+const face = document.getElementById('face');
+const rowsEl = document.getElementById('rows');
+const measure = document.getElementById('measure');
+const btn = document.getElementById('btn');
+const statusEl = document.getElementById('status');
+
+let rows = [];     // row elements, oldest first; the last one is the main row
+let current = [];  // numbers in the main row
+
+const vmin = () => face.getBoundingClientRect().width / 100;
+const levelOf = (i) => SIZES.length - rows.length + i;
+
+function renderRow(el, nums) {
+  el.textContent = '';
+  nums.forEach((n, i) => {
+    if (i) { const sep = document.createElement('span'); sep.className = 'sep'; sep.textContent = '-'; el.appendChild(sep); }
+    const span = document.createElement('span');
+    span.className = i === nums.length - 1 ? 'n new' : 'n';
+    span.textContent = String(n);
+    el.appendChild(span);
+  });
+}
+
+function fitRow(el, level, instant) {
+  const v = vmin(), base = SIZES[level] * v, max = MAXW[level] * v;
+  measure.style.fontSize = base + 'px';
+  measure.style.fontWeight = level === SIZES.length - 1 ? '700' : '500';
+  measure.innerHTML = el.innerHTML;
+  const w = measure.getBoundingClientRect().width;
+  if (instant) el.style.transition = 'none';   // row just got longer: shrink at once, no overflow
+  el.style.fontSize = (w > max ? base * max / w : base) + 'px';
+  if (instant) { void el.offsetWidth; el.style.transition = ''; }
+}
+
+function layout(shifted) {
+  rows.forEach((el, i) => {
+    const lv = levelOf(i);
+    el.className = 'row l' + lv;
+    fitRow(el, lv, !shifted);
+  });
+}
+
+function addNumber(n) {
+  const shift = !rows.length || current.length >= CONFIG.perRow;
+  if (shift) {
+    current = [];
+    const el = document.createElement('div');
+    el.className = 'row l' + (SIZES.length - 1);
+    el.style.fontSize = '0px';
+    rowsEl.appendChild(el);
+    rows.push(el);
+    if (rows.length > CONFIG.rows) {
+      const old = rows.shift();
+      old.classList.add('gone');
+      old.style.fontSize = '0px';
+      setTimeout(() => old.remove(), 400);
+    }
+    void el.offsetWidth; // let the new row grow from 0
+  }
+  current.push(n);
+  renderRow(rows[rows.length - 1], current);
+  layout(shift);
+}
+
+function handleNumbers(list) { list.forEach(addNumber); }
+
+window.addEventListener('resize', () => layout(false));
+
+// ---------------------------------------------------------------- helpers
+const lsGet = (k) => { try { return localStorage.getItem(k); } catch (e) { return null; } };
+const lsSet = (k, v) => { try { localStorage.setItem(k, v); } catch (e) {} };
+const setStatus = (msg) => { statusEl.textContent = msg || ''; };
+const setBtn = (cls, label) => { btn.className = cls; btn.textContent = label; };
+
+// ---------------------------------------------------------------- keep the screen on
+// Screen Wake Lock API where available; otherwise a tiny looping video, which also keeps
+// Android screens awake. Video clips from NoSleep.js (c) Rich Tibbett, MIT licence.
+const wake = (() => {
+  const WEBM = 'data:video/webm;base64,GkXfowEAAAAAAAAfQoaBAUL3gQFC8oEEQvOBCEKChHdlYm1Ch4EEQoWBAhhTgGcBAAAAAAAVkhFNm3RALE27i1OrhBVJqWZTrIHfTbuMU6uEFlSua1OsggEwTbuMU6uEHFO7a1OsghV17AEAAAAAAACkAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAVSalmAQAAAAAAAEUq17GDD0JATYCNTGF2ZjU1LjMzLjEwMFdBjUxhdmY1NS4zMy4xMDBzpJBlrrXf3DCDVB8KcgbMpcr+RImIQJBgAAAAAAAWVK5rAQAAAAAAD++uAQAAAAAAADLXgQFzxYEBnIEAIrWcg3VuZIaFVl9WUDiDgQEj44OEAmJaAOABAAAAAAAABrCBsLqBkK4BAAAAAAAPq9eBAnPFgQKcgQAitZyDdW5khohBX1ZPUkJJU4OBAuEBAAAAAAAAEZ+BArWIQOdwAAAAAABiZIEgY6JPbwIeVgF2b3JiaXMAAAAAAoC7AAAAAAAAgLUBAAAAAAC4AQN2b3JiaXMtAAAAWGlwaC5PcmcgbGliVm9yYmlzIEkgMjAxMDExMDEgKFNjaGF1ZmVudWdnZXQpAQAAABUAAABlbmNvZGVyPUxhdmM1NS41Mi4xMDIBBXZvcmJpcyVCQ1YBAEAAACRzGCpGpXMWhBAaQlAZ4xxCzmvsGUJMEYIcMkxbyyVzkCGkoEKIWyiB0JBVAABAAACHQXgUhIpBCCGEJT1YkoMnPQghhIg5eBSEaUEIIYQQQgghhBBCCCGERTlokoMnQQgdhOMwOAyD5Tj4HIRFOVgQgydB6CCED0K4moOsOQghhCQ1SFCDBjnoHITCLCiKgsQwuBaEBDUojILkMMjUgwtCiJqDSTX4GoRnQXgWhGlBCCGEJEFIkIMGQcgYhEZBWJKDBjm4FITLQagahCo5CB+EIDRkFQCQAACgoiiKoigKEBqyCgDIAAAQQFEUx3EcyZEcybEcCwgNWQUAAAEACAAAoEiKpEiO5EiSJFmSJVmSJVmS5omqLMuyLMuyLMsyEBqyCgBIAABQUQxFcRQHCA1ZBQBkAAAIoDiKpViKpWiK54iOCISGrAIAgAAABAAAEDRDUzxHlETPVFXXtm3btm3btm3btm3btm1blmUZCA1ZBQBAAAAQ0mlmqQaIMAMZBkJDVgEACAAAgBGKMMSA0JBVAABAAACAGEoOogmtOd+c46BZDppKsTkdnEi1eZKbirk555xzzsnmnDHOOeecopxZDJoJrTnnnMSgWQqaCa0555wnsXnQmiqtOeeccc7pYJwRxjnnnCateZCajbU555wFrWmOmkuxOeecSLl5UptLtTnnnHPOOeecc84555zqxekcnBPOOeecqL25lpvQxTnnnE/G6d6cEM4555xzzjnnnHPOOeecIDRkFQAABABAEIaNYdwpCNLnaCBGEWIaMulB9+gwCRqDnELq0ehopJQ6CCWVcVJKJwgNWQUAAAIAQAghhRRSSCGFFFJIIYUUYoghhhhyyimnoIJKKqmooowyyyyzzDLLLLPMOuyssw47DDHEEEMrrcRSU2011lhr7jnnmoO0VlprrbVSSimllFIKQkNWAQAgAAAEQgYZZJBRSCGFFGKIKaeccgoqqIDQkFUAACAAgAAAAABP8hzRER3RER3RER3RER3R8RzPESVREiVREi3TMjXTU0VVdWXXlnVZt31b2IVd933d933d+HVhWJZlWZZlWZZlWZZlWZZlWZYgNGQVAAACAAAghBBCSCGFFFJIKcYYc8w56CSUEAgNWQUAAAIACAAAAHAUR3EcyZEcSbIkS9IkzdIsT/M0TxM9URRF0zRV0RVdUTdtUTZl0zVdUzZdVVZtV5ZtW7Z125dl2/d93/d93/d93/d93/d9XQdCQ1YBABIAADqSIymSIimS4ziOJElAaMgqAEAGAEAAAIriKI7jOJIkSZIlaZJneZaomZrpmZ4qqkBoyCoAABAAQAAAAAAAAIqmeIqpeIqoeI7oiJJomZaoqZoryqbsuq7ruq7ruq7ruq7ruq7ruq7ruq7ruq7ruq7ruq7ruq7ruq4LhIasAgAkAAB0JEdyJEdSJEVSJEdygNCQVQCADACAAAAcwzEkRXIsy9I0T/M0TxM90RM901NFV3SB0JBVAAAgAIAAAAAAAAAMybAUy9EcTRIl1VItVVMt1VJF1VNVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVN0zRNEwgNWQkAkAEAkBBTLS3GmgmLJGLSaqugYwxS7KWxSCpntbfKMYUYtV4ah5RREHupJGOKQcwtpNApJq3WVEKFFKSYYyoVUg5SIDRkhQAQmgHgcBxAsixAsiwAAAAAAAAAkDQN0DwPsDQPAAAAAAAAACRNAyxPAzTPAwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABA0jRA8zxA8zwAAAAAAAAA0DwP8DwR8EQRAAAAAAAAACzPAzTRAzxRBAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABA0jRA8zxA8zwAAAAAAAAAsDwP8EQR0DwRAAAAAAAAACzPAzxRBDzRAwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEAAAEOAAABBgIRQasiIAiBMAcEgSJAmSBM0DSJYFTYOmwTQBkmVB06BpME0AAAAAAAAAAAAAJE2DpkHTIIoASdOgadA0iCIAAAAAAAAAAAAAkqZB06BpEEWApGnQNGgaRBEAAAAAAAAAAAAAzzQhihBFmCbAM02IIkQRpgkAAAAAAAAAAAAAAAAAAAAAAAAAAAAACAAAGHAAAAgwoQwUGrIiAIgTAHA4imUBAIDjOJYFAACO41gWAABYliWKAABgWZooAgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIAAAYcAAACDChDBQashIAiAIAcCiKZQHHsSzgOJYFJMmyAJYF0DyApgFEEQAIAAAocAAACLBBU2JxgEJDVgIAUQAABsWxLE0TRZKkaZoniiRJ0zxPFGma53meacLzPM80IYqiaJoQRVE0TZimaaoqME1VFQAAUOAAABBgg6bE4gCFhqwEAEICAByKYlma5nmeJ4qmqZokSdM8TxRF0TRNU1VJkqZ5niiKommapqqyLE3zPFEURdNUVVWFpnmeKIqiaaqq6sLzPE8URdE0VdV14XmeJ4qiaJqq6roQRVE0TdNUTVV1XSCKpmmaqqqqrgtETxRNU1Vd13WB54miaaqqq7ouEE3TVFVVdV1ZBpimaaqq68oyQFVV1XVdV5YBqqqqruu6sgxQVdd1XVmWZQCu67qyLMsCAAAOHAAAAoygk4wqi7DRhAsPQKEhKwKAKAAAwBimFFPKMCYhpBAaxiSEFEImJaXSUqogpFJSKRWEVEoqJaOUUmopVRBSKamUCkIqJZVSAADYgQMA2IGFUGjISgAgDwCAMEYpxhhzTiKkFGPOOScRUoox55yTSjHmnHPOSSkZc8w556SUzjnnnHNSSuacc845KaVzzjnnnJRSSuecc05KKSWEzkEnpZTSOeecEwAAVOAAABBgo8jmBCNBhYasBABSAQAMjmNZmuZ5omialiRpmud5niiapiZJmuZ5nieKqsnzPE8URdE0VZXneZ4oiqJpqirXFUXTNE1VVV2yLIqmaZqq6rowTdNUVdd1XZimaaqq67oubFtVVdV1ZRm2raqq6rqyDFzXdWXZloEsu67s2rIAAPAEBwCgAhtWRzgpGgssNGQlAJABAEAYg5BCCCFlEEIKIYSUUggJAAAYcAAACDChDBQashIASAUAAIyx1lprrbXWQGettdZaa62AzFprrbXWWmuttdZaa6211lJrrbXWWmuttdZaa6211lprrbXWWmuttdZaa6211lprrbXWWmuttdZaa6211lprrbXWWmstpZRSSimllFJKKaWUUkoppZRSSgUA+lU4APg/2LA6wknRWGChISsBgHAAAMAYpRhzDEIppVQIMeacdFRai7FCiDHnJKTUWmzFc85BKCGV1mIsnnMOQikpxVZjUSmEUlJKLbZYi0qho5JSSq3VWIwxqaTWWoutxmKMSSm01FqLMRYjbE2ptdhqq7EYY2sqLbQYY4zFCF9kbC2m2moNxggjWywt1VprMMYY3VuLpbaaizE++NpSLDHWXAAAd4MDAESCjTOsJJ0VjgYXGrISAAgJACAQUooxxhhzzjnnpFKMOeaccw5CCKFUijHGnHMOQgghlIwx5pxzEEIIIYRSSsaccxBCCCGEkFLqnHMQQgghhBBKKZ1zDkIIIYQQQimlgxBCCCGEEEoopaQUQgghhBBCCKmklEIIIYRSQighlZRSCCGEEEIpJaSUUgohhFJCCKGElFJKKYUQQgillJJSSimlEkoJJYQSUikppRRKCCGUUkpKKaVUSgmhhBJKKSWllFJKIYQQSikFAAAcOAAABBhBJxlVFmGjCRcegEJDVgIAZAAAkKKUUiktRYIipRikGEtGFXNQWoqocgxSzalSziDmJJaIMYSUk1Qy5hRCDELqHHVMKQYtlRhCxhik2HJLoXMOAAAAQQCAgJAAAAMEBTMAwOAA4XMQdAIERxsAgCBEZohEw0JweFAJEBFTAUBigkIuAFRYXKRdXECXAS7o4q4DIQQhCEEsDqCABByccMMTb3jCDU7QKSp1IAAAAAAADADwAACQXAAREdHMYWRobHB0eHyAhIiMkAgAAAAAABcAfAAAJCVAREQ0cxgZGhscHR4fICEiIyQBAIAAAgAAAAAggAAEBAQAAAAAAAIAAAAEBB9DtnUBAAAAAAAEPueBAKOFggAAgACjzoEAA4BwBwCdASqwAJAAAEcIhYWIhYSIAgIABhwJ7kPfbJyHvtk5D32ych77ZOQ99snIe+2TkPfbJyHvtk5D32ych77ZOQ99YAD+/6tQgKOFggADgAqjhYIAD4AOo4WCACSADqOZgQArADECAAEQEAAYABhYL/QACIBDmAYAAKOFggA6gA6jhYIAT4AOo5mBAFMAMQIAARAQABgAGFgv9AAIgEOYBgAAo4WCAGSADqOFggB6gA6jmYEAewAxAgABEBAAGAAYWC/0AAiAQ5gGAACjhYIAj4AOo5mBAKMAMQIAARAQABgAGFgv9AAIgEOYBgAAo4WCAKSADqOFggC6gA6jmYEAywAxAgABEBAAGAAYWC/0AAiAQ5gGAACjhYIAz4AOo4WCAOSADqOZgQDzADECAAEQEAAYABhYL/QACIBDmAYAAKOFggD6gA6jhYIBD4AOo5iBARsAEQIAARAQFGAAYWC/0AAiAQ5gGACjhYIBJIAOo4WCATqADqOZgQFDADECAAEQEAAYABhYL/QACIBDmAYAAKOFggFPgA6jhYIBZIAOo5mBAWsAMQIAARAQABgAGFgv9AAIgEOYBgAAo4WCAXqADqOFggGPgA6jmYEBkwAxAgABEBAAGAAYWC/0AAiAQ5gGAACjhYIBpIAOo4WCAbqADqOZgQG7ADECAAEQEAAYABhYL/QACIBDmAYAAKOFggHPgA6jmYEB4wAxAgABEBAAGAAYWC/0AAiAQ5gGAACjhYIB5IAOo4WCAfqADqOZgQILADECAAEQEAAYABhYL/QACIBDmAYAAKOFggIPgA6jhYICJIAOo5mBAjMAMQIAARAQABgAGFgv9AAIgEOYBgAAo4WCAjqADqOFggJPgA6jmYECWwAxAgABEBAAGAAYWC/0AAiAQ5gGAACjhYICZIAOo4WCAnqADqOZgQKDADECAAEQEAAYABhYL/QACIBDmAYAAKOFggKPgA6jhYICpIAOo5mBAqsAMQIAARAQABgAGFgv9AAIgEOYBgAAo4WCArqADqOFggLPgA6jmIEC0wARAgABEBAUYABhYL/QACIBDmAYAKOFggLkgA6jhYIC+oAOo5mBAvsAMQIAARAQABgAGFgv9AAIgEOYBgAAo4WCAw+ADqOZgQMjADECAAEQEAAYABhYL/QACIBDmAYAAKOFggMkgA6jhYIDOoAOo5mBA0sAMQIAARAQABgAGFgv9AAIgEOYBgAAo4WCA0+ADqOFggNkgA6jmYEDcwAxAgABEBAAGAAYWC/0AAiAQ5gGAACjhYIDeoAOo4WCA4+ADqOZgQObADECAAEQEAAYABhYL/QACIBDmAYAAKOFggOkgA6jhYIDuoAOo5mBA8MAMQIAARAQABgAGFgv9AAIgEOYBgAAo4WCA8+ADqOFggPkgA6jhYID+oAOo4WCBA+ADhxTu2sBAAAAAAAAEbuPs4EDt4r3gQHxghEr8IEK';
+  const MP4 = 'data:video/mp4;base64,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';
+  let lock = null, video = null, want = false;
+  function playVideo() {
+    if (!video) {
+      video = document.createElement('video');
+      video.setAttribute('playsinline', '');
+      video.setAttribute('title', 'keep awake');
+      [['webm', WEBM], ['mp4', MP4]].forEach(([type, src]) => {
+        const s = document.createElement('source'); s.type = 'video/' + type; s.src = src; video.appendChild(s);
+      });
+      video.addEventListener('loadedmetadata', () => {
+        if (video.duration <= 1) video.loop = true;
+        else video.addEventListener('timeupdate', () => { if (video.currentTime > 0.5) video.currentTime = Math.random(); });
+      });
+    }
+    video.play().catch(() => {});
+  }
+  async function acquire() {
+    if ('wakeLock' in navigator) {
+      try {
+        lock = await navigator.wakeLock.request('screen');
+        lock.addEventListener('release', () => { lock = null; });
+        return;
+      } catch (e) { /* fall through to the video */ }
+    }
+    if (want) playVideo();
+  }
+  document.addEventListener('visibilitychange', () => {
+    if (want && document.visibilityState === 'visible' && !lock) acquire();
+  });
+  return {
+    on() { want = true; acquire(); },
+    off() {
+      want = false;
+      if (lock) { lock.release().catch(() => {}); lock = null; }
+      if (video) video.pause();
+    },
+  };
+})();
+
+// ---------------------------------------------------------------- start / stop
+const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+let running = false;
+let session = 0;   // bumps on every start/stop so stale async work can bail out
+
+function pickEngine() {
+  const q = new URLSearchParams(location.search).get('engine');
+  if (q === 'web' || q === 'vosk') return q;
+  if (lsGet('numbers.engine') === 'vosk') return 'vosk';
+  return SR ? 'web' : 'vosk';
+}
+
+function start() {
+  running = true;
+  const my = ++session;
+  setStatus('');
+  wake.on();
+  if (pickEngine() === 'web') startWeb(my); else startVosk(my);
+}
+
+function stop(message) {
+  running = false;
+  session++;
+  stopWeb();
+  stopVosk();
+  wake.off();
+  setBtn('', 'Start');
+  setStatus(message || '');
+}
+
+btn.addEventListener('click', () => { if (running) stop(); else start(); });
+
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible' && audio && audio.ctx.state === 'suspended') audio.ctx.resume().catch(() => {});
+});
+
+// ---------------------------------------------------------------- engine 1: browser speech recognition
+let rec = null;
+let quickEnds = 0;
+
+function startWeb(my) {
+  setBtn('stop', 'Stop');
+  const r = new SR();
+  rec = r;
+  r.lang = CONFIG.lang;
+  r.interimResults = false;
+  r.maxAlternatives = 1;
+  // Android ends a session after each phrase anyway; restarting is more reliable there.
+  r.continuous = !/Android/i.test(navigator.userAgent);
+  let began = 0, heard = false;
+  const done = new Set();
+  r.onaudiostart = () => { heard = true; quickEnds = 0; };
+  r.onresult = (e) => {
+    for (let i = e.resultIndex; i < e.results.length; i++) {
+      if (!e.results[i].isFinal || done.has(i)) continue;
+      done.add(i);
+      handleNumbers(parseNumbers(e.results[i][0].transcript));
+    }
+  };
+  r.onerror = (e) => {
+    if (my !== session || rec !== r) return;
+    if (e.error === 'no-speech' || e.error === 'aborted') return;
+    // network / service-not-allowed / language-not-supported / audio-capture: the browser's
+    // recogniser can't work here, so use the on-device one (it reports a missing mic itself).
+    // not-allowed may just be a denied prompt, so don't remember that one.
+    fallbackToVosk(my, e.error !== 'not-allowed');
+  };
+  r.onend = () => {
+    if (my !== session || rec !== r) return;
+    if (!heard && Date.now() - began < 1500 && ++quickEnds >= 4) { fallbackToVosk(my, true); return; }
+    setTimeout(() => {
+      if (my !== session || rec !== r) return;
+      began = Date.now(); heard = false; done.clear();
+      try { r.start(); } catch (err) { fallbackToVosk(my, true); }
+    }, 250);
+  };
+  began = Date.now();
+  try { r.start(); } catch (err) { fallbackToVosk(my, true); }
+}
+
+function stopWeb() {
+  if (!rec) return;
+  const r = rec;
+  rec = null;
+  try { r.abort(); } catch (e) {}
+}
+
+function fallbackToVosk(my, remember) {
+  if (my !== session) return;
+  stopWeb();
+  if (remember) lsSet('numbers.engine', 'vosk');
+  startVosk(my);
+}
+
+// ---------------------------------------------------------------- engine 2: on-device (Vosk, WebAssembly)
+let voskModel = null, voskLoading = null, audio = null;
+
+function loadScript(src) {
+  return new Promise((resolve, reject) => {
+    const s = document.createElement('script');
+    s.src = src; s.async = true;
+    s.onload = resolve;
+    s.onerror = () => { s.remove(); reject(new Error('lib')); };
+    document.head.appendChild(s);
+  });
+}
+
+async function loadVoskLib() {
+  if (window.Vosk) return;
+  for (const src of CONFIG.voskLib) {
+    try { await loadScript(src); if (window.Vosk) return; } catch (e) {}
+  }
+  throw new Error('lib');
+}
+
+async function modelUrl() {
+  // Must be absolute: the library resolves relative URLs against its worker, not this page.
+  const local = new URL(CONFIG.modelFile, location.href).href;
+  try { const r = await fetch(local, { method: 'HEAD', cache: 'no-store' }); if (r.ok) return local; } catch (e) {}
+  return CONFIG.modelFallback;
+}
+
+function getModel() {
+  if (voskModel) return Promise.resolve(voskModel);
+  if (!voskLoading) {
+    voskLoading = (async () => {
+      await loadVoskLib();
+      const url = await modelUrl();
+      // The model is downloaded once, then kept in the browser's storage (IndexedDB).
+      const m = new window.Vosk.Model(url, -1);  // -1: only log warnings/errors
+      await new Promise((resolve, reject) => {
+        m.on('load', (msg) => (msg && msg.result ? resolve() : reject(new Error('model'))));
+        m.on('error', () => reject(new Error('model')));
+      });
+      voskModel = m;
+      return m;
+    })().catch((e) => { voskLoading = null; throw e; });
+  }
+  return voskLoading;
+}
+
+function numbersFromVosk(result) {
+  if (!result) return [];
+  const words = result.result;
+  if (!Array.isArray(words) || !words.length) return parseNumbers(result.text);
+  let text = '', prevEnd = null;
+  for (const w of words) {
+    if (prevEnd !== null && w.start - prevEnd >= CONFIG.pauseSplit) text += ' ,';
+    text += ' ' + w.word;
+    prevEnd = w.end;
+  }
+  return parseNumbers(text);
+}
+
+function errorMessage(err) {
+  const name = err && err.name, msg = err && err.message;
+  if (name === 'NotAllowedError' || name === 'SecurityError') return 'Microphone blocked';
+  if (name === 'NotFoundError') return 'No microphone found';
+  if (msg === 'lib') return 'Could not load speech engine';
+  if (msg === 'model') return 'Speech model failed to load';
+  if (!navigator.mediaDevices) return 'This browser can’t use the mic';
+  return 'Speech not available here';
+}
+
+async function startVosk(my) {
+  setBtn('busy', 'Loading');
+  const t0 = Date.now();
+  if (!lsGet('numbers.model')) setStatus('First run: ~40 MB download');
+  const tick = setInterval(() => {
+    if (my === session && !audio) btn.textContent = 'Loading ' + Math.round((Date.now() - t0) / 1000) + 's';
+  }, 1000);
+  try {
+    const model = await getModel();
+    if (my !== session) return;
+    lsSet('numbers.model', '1');
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) throw new Error('nomic');
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 },
+    });
+    if (my !== session) { stream.getTracks().forEach((t) => t.stop()); return; }
+    let ctx, src;
+    try {
+      ctx = new AudioContext({ sampleRate: 16000 }); // model's native rate: less work on the watch
+      src = ctx.createMediaStreamSource(stream);
+    } catch (e) {
+      if (ctx) ctx.close().catch(() => {});
+      ctx = new AudioContext();
+      src = ctx.createMediaStreamSource(stream);
+    }
+    const recognizer = new model.KaldiRecognizer(ctx.sampleRate, GRAMMAR);
+    recognizer.setWords(true);
+    recognizer.on('result', (msg) => handleNumbers(numbersFromVosk(msg.result)));
+    const proc = ctx.createScriptProcessor(4096, 1, 1);
+    proc.onaudioprocess = (e) => { try { recognizer.acceptWaveform(e.inputBuffer); } catch (err) {} };
+    src.connect(proc);
+    proc.connect(ctx.destination);
+    if (ctx.state !== 'running') { try { await ctx.resume(); } catch (e) {} }
+    audio = { ctx, stream, src, proc, recognizer };
+    setBtn('stop', 'Stop');
+    setStatus('');
+  } catch (err) {
+    if (my === session) stop(errorMessage(err));
+  } finally {
+    clearInterval(tick);
+  }
+}
+
+function stopVosk() {
+  if (!audio) return;
+  const a = audio;
+  audio = null;
+  try { a.proc.onaudioprocess = null; a.src.disconnect(); a.proc.disconnect(); } catch (e) {}
+  a.stream.getTracks().forEach((t) => t.stop());
+  try { a.recognizer.retrieveFinalResult(); } catch (e) {}   // flush the last few words
+  setTimeout(() => { try { a.recognizer.remove(); } catch (e) {} }, 800);
+  a.ctx.close().catch(() => {});
+}
+
+// For testing in a desktop browser console.
+window.numbersApp = { parseNumbers, addNumber, numbersFromVosk };
+})();
+</script>
+</body>
+</html>
