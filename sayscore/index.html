@@ -52,11 +52,13 @@
   #btn.busy { background: #3a3a3a; color: #fff; font-size: 6.2vmin; white-space: nowrap; }
   #btn:active { filter: brightness(.85); }
   #measure { position: absolute; left: -9999px; top: 0; visibility: hidden; white-space: nowrap; line-height: 1.08; }
+  #debug { position: absolute; left: 18vmin; right: 18vmin; top: 7vmin; text-align: center; white-space: pre-line; font: 500 4.3vmin/1.2 var(--font); color: #6fc3ff; }
 </style>
 </head>
 <body>
 <div id="face">
   <div id="rows" aria-live="polite"></div>
+  <div id="debug"></div>
   <div id="status" role="status"></div>
   <button id="btn" type="button">Start</button>
 </div>
@@ -79,7 +81,12 @@ const CONFIG = {
   modelParts: ['sayscore-model.part1', 'sayscore-model.part2'],  // ...or the same split in two
   modelFallback: 'https://ccoreilly.github.io/vosk-browser/models/vosk-model-small-en-us-0.15.tar.gz',
   pauseSplit: 0.1,    // seconds of silence between words that starts a new number
+  // Slow devices (watches): above this CPU load the page stops sending silence to the
+  // recogniser and asks for each result as soon as the speaker stops. ?gate=on / ?gate=off override.
+  gateLoad: 0.4,
 };
+const PARAMS = new URLSearchParams(location.search);
+const DEBUG = PARAMS.has('debug');   // ?debug shows speed / lag figures at the top
 const SIZES = [9.5, 12.5, 20];  // font size in vmin: top, middle, main
 const MAXW  = [74, 84, 90];     // widest a row may be in vmin before it is scaled down
 
@@ -415,6 +422,33 @@ async function modelSource() {
 // the split model parts into one download, and passes on errors the library would swallow.
 function workerPrelude(src) {
   const realFetch = self.fetch.bind(self);
+  // The library turns every audio chunk into text for a debug log it never prints; skip that.
+  const realStringify = JSON.stringify;
+  JSON.stringify = function (v, a, b) {
+    return v && v.action === 'audioChunk' ? '{"action":"audioChunk"}' : realStringify(v, a, b);
+  };
+  // Time the recogniser on each audio chunk so the page can tell whether this device keeps up.
+  const realAdd = self.addEventListener.bind(self);
+  let busy = 0, heard = 0, lastPost = 0;
+  self.addEventListener = function (type, fn, opts) {
+    if (type !== 'message') return realAdd(type, fn, opts);
+    return realAdd(type, function (e) {
+      const d = e.data;
+      if (!d || d.action !== 'audioChunk' || !d.data) return fn.call(this, e);
+      const t = performance.now();
+      const r = fn.call(this, e);
+      let dt = performance.now() - t;
+      if (src.slow > 1) {   // testing only: pretend to be a slower device
+        const until = performance.now() + dt * (src.slow - 1);
+        while (performance.now() < until) { /* spin */ }
+        dt *= src.slow;
+      }
+      busy += dt / 1000;
+      heard += d.data.length / (d.sampleRate || 16000);
+      if (t - lastPost > 1000) { lastPost = t; self.postMessage({ event: 'perf', busy, heard }); }
+      return r;
+    }, opts);
+  };
   self.addEventListener('unhandledrejection', (e) => {
     self.postMessage({ event: 'error', error: 'worker: ' + (e.reason && e.reason.message || e.reason) });
   });
@@ -464,6 +498,7 @@ function getModel() {
       setStage('engine');
       await loadVoskLib();
       const src = await modelSource();
+      src.slow = Number(PARAMS.get('slow')) || 1;
       setStage('model');
       let crash;
       const crashed = new Promise((resolve, reject) => { crash = reject; });
@@ -480,6 +515,7 @@ function getModel() {
       };
       let m;
       try { m = new window.Vosk.Model(src.url, -1); } finally { window.Worker = RealWorker; }
+      m.on('perf', onPerf);
       m.on('progress', (p) => { progress = { loaded: p.loaded, total: p.total, done: !!p.done, at: Date.now() }; if (p.done) setStage('unpack'); else loadStage = 'download'; });
       // The model is downloaded once, then kept in the browser's storage (IndexedDB).
       await Promise.race([crashed, new Promise((resolve, reject) => {
@@ -504,6 +540,111 @@ function numbersFromVosk(result) {
     prevEnd = w.end;
   }
   return parseNumbers(text);
+}
+
+// ---------------------------------------------------------------- speed tracking + silence gate
+// The recogniser reports how long it spends per second of audio ("load"). If a device can't
+// comfortably keep up (a watch), feeding it continuous audio makes it fall further behind the
+// longer it listens. So on slow devices the page only sends audio while someone is talking
+// (plus a short lead-in), and asks for the result as soon as they stop. Between calls the
+// recogniser sits idle and catches up, which also saves battery.
+const dbg = { load: 0, heard: 0, busy: 0, sent: 0, heardBase: 0, gate: false, open: false,
+              micAt: 0, speechEndAt: 0, lastResultAt: 0, lastDelay: null, log: [], rate: 0 };
+
+function gateWanted() {
+  const g = PARAMS.get('gate');
+  if (g === 'on') return true;
+  if (g === 'off') return false;
+  return lsGet('numbers.gate') === '1';
+}
+
+function onPerf(p) {
+  const dHeard = p.heard - dbg.heard, dBusy = p.busy - dbg.busy;
+  dbg.heard = p.heard; dbg.busy = p.busy;
+  if (dHeard > 0.3) {
+    const load = dBusy / dHeard;
+    dbg.load = dbg.load ? dbg.load * 0.6 + load * 0.4 : load;
+  }
+  if (!PARAMS.get('gate') && !dbg.gate && dbg.load > CONFIG.gateLoad && dbg.heard - dbg.heardBase > 2) {
+    dbg.gate = true;                 // this device is slow: gate from now on
+    lsSet('numbers.gate', '1');
+  }
+  showDebug();
+}
+
+function showDebug() {
+  const el = document.getElementById('debug');
+  if (!DEBUG || !el) return;
+  if (!audio) { el.textContent = ''; return; }
+  const behind = Math.max(0, dbg.sent - (dbg.heard - dbg.heardBase));
+  el.textContent = 'CPU ' + Math.round(dbg.load * 100) + '%' +
+    (dbg.gate ? ' · gate' + (dbg.open ? ' ●' : ' ○') : '') +
+    (dbg.rate && dbg.rate !== 16000 ? ' · ' + Math.round(dbg.rate / 1000) + 'kHz' : '') + '\n' +
+    'behind ' + behind.toFixed(1) + 's' +
+    (dbg.lastDelay !== null ? ' · last ' + dbg.lastDelay.toFixed(1) + 's' : '');
+}
+setInterval(showDebug, 1000);
+
+function wireAudio(ctx, recognizer) {
+  const SIZE = 2048;                                  // 128 ms per chunk at 16 kHz
+  const chunkSec = SIZE / ctx.sampleRate;
+  const PRE = Math.ceil(0.35 / chunkSec);             // lead-in kept from before the speech
+  const HANG = Math.ceil(0.6 / chunkSec);             // silence after speech before asking for the result
+  const MAXOPEN = Math.ceil(8 / chunkSec);            // never stay open longer than this
+  const proc = ctx.createScriptProcessor(SIZE, 1, 1);
+  const pre = [];
+  let noise = 0, hang = 0, openFor = 0;
+  dbg.gate = gateWanted(); dbg.open = false; dbg.rate = ctx.sampleRate;
+  dbg.sent = 0; dbg.heardBase = dbg.heard; dbg.lastDelay = null; dbg.speechEndAt = 0;
+  const send = (x) => {
+    try { recognizer.acceptWaveformFloat(x, ctx.sampleRate); } catch (err) {}
+    dbg.sent += x.length / ctx.sampleRate;
+  };
+  // Loudness is judged in 16 ms slices: speech stays loud for many slices in a row, while a
+  // paddle pop or a clap fills only one or two, so pops don't open the gate.
+  const SLICE = Math.round(ctx.sampleRate * 0.016);
+  const ABS_MIN = 4e-6;                                // ignore anything quieter than this (power)
+  proc.onaudioprocess = (e) => {
+    const x = new Float32Array(e.inputBuffer.getChannelData(0));   // copy: the browser may reuse it
+    // The speech detector always runs, so it is already tuned to the room if the gate switches
+    // on mid-session; with the gate off every chunk is still sent straight away.
+    const gating = dbg.gate;
+    const slices = Math.floor(x.length / SLICE);
+    const powers = new Array(slices);
+    let quietest = Infinity;
+    for (let k = 0; k < slices; k++) {
+      let s = 0;
+      for (let i = k * SLICE, end = i + SLICE; i < end; i++) s += x[i] * x[i];
+      powers[k] = s / SLICE;
+      if (powers[k] < quietest) quietest = powers[k];
+    }
+    if (!noise) noise = Math.max(quietest, 1e-7);
+    const thr = Math.max(noise * (dbg.open ? 3 : 6), ABS_MIN);  // +5 dB to stay open, +8 dB to open
+    let loudSlices = 0;
+    for (let k = 0; k < slices; k++) if (powers[k] > thr) loudSlices++;
+    const loud = loudSlices >= (dbg.open ? 2 : 4);              // 4 slices = 64 ms of sound to open
+    // Background level follows the quietest slice, which pops and voices barely touch.
+    noise += (quietest - noise) * (quietest < noise ? 0.3 : (dbg.open ? 0.01 : 0.05));
+    if (dbg.open) {
+      send(x);
+      openFor++;
+      if (loud) { hang = HANG; dbg.speechEndAt = performance.now(); }
+      else if (--hang <= 0 || openFor > MAXOPEN) {
+        dbg.open = false;
+        if (gating) { try { recognizer.retrieveFinalResult(); } catch (err) {} }
+      }
+    } else if (loud) {
+      dbg.open = true; hang = HANG; openFor = 0; dbg.speechEndAt = performance.now();
+      pre.forEach(send); pre.length = 0;
+      send(x);
+    } else if (gating) {
+      pre.push(x);                      // hold back silence; keep a short lead-in
+      if (pre.length > PRE) pre.shift();
+    } else {
+      send(x);
+    }
+  };
+  return proc;
 }
 
 function errorMessage(err) {
@@ -554,9 +695,11 @@ async function startVosk(my) {
     // Ask for the mic first: if this browser can't give web pages the mic, say so before
     // spending minutes downloading the model.
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) throw new Error('nomic');
+    dbg.micAt = 0;
     stream = await navigator.mediaDevices.getUserMedia({
       audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 },
     });
+    dbg.micAt = performance.now();
     if (my !== session) { dropStream(); return; }
     if (!voskModel) setStage('engine');
     tick();
@@ -574,9 +717,16 @@ async function startVosk(my) {
     }
     const recognizer = new model.KaldiRecognizer(ctx.sampleRate, GRAMMAR);
     recognizer.setWords(true);
-    recognizer.on('result', (msg) => handleNumbers(numbersFromVosk(msg.result)));
-    const proc = ctx.createScriptProcessor(4096, 1, 1);
-    proc.onaudioprocess = (e) => { try { recognizer.acceptWaveform(e.inputBuffer); } catch (err) {} };
+    recognizer.on('result', (msg) => {
+      const nums = numbersFromVosk(msg.result);
+      if (nums.length) {
+        dbg.lastResultAt = performance.now();
+        dbg.log.push({ t: dbg.lastResultAt, nums });
+        if (dbg.speechEndAt) dbg.lastDelay = (dbg.lastResultAt - dbg.speechEndAt) / 1000;
+      }
+      handleNumbers(nums);
+    });
+    const proc = wireAudio(ctx, recognizer);
     src.connect(proc);
     proc.connect(ctx.destination);
     if (ctx.state !== 'running') { try { await ctx.resume(); } catch (e) {} }
@@ -609,7 +759,7 @@ function stopVosk() {
 }
 
 // For testing in a desktop browser console.
-window.numbersApp = { parseNumbers, handleNumbers, numbersFromVosk };
+window.numbersApp = { parseNumbers, handleNumbers, numbersFromVosk, dbg: () => dbg };
 })();
 </script>
 </body>
