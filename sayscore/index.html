@@ -117,6 +117,21 @@ function digitSplits(d) {
   return out.length ? out : [d.split('').map(Number)];
 }
 
+// Pickleball doubles: the third number of a call is the server number, so it can only be 1 or 2.
+const isServer = (n) => n === 1 || n === 2;
+
+// How many complete calls (two scores + a 1 or 2) a run of numbers contains, grouped the same
+// way the display groups them.
+function completeCalls(nums) {
+  let len = 0, full = 0;
+  for (const n of nums) {
+    if (len === 2 && isServer(n)) { full++; len = 0; }
+    else if (len === 2) len = 1;     // not a server number: it starts the next call
+    else len++;
+  }
+  return full;
+}
+
 // Turns one recognised phrase into numbers. Where a phrase can be read more than one way
 // ("twenty five two" = 25,2 or 20,5,2; "112" = 11,2 or 1,1,2), it picks the reading that is a
 // complete score call (three numbers ending in server 1 or 2), otherwise the plainest reading.
@@ -154,8 +169,7 @@ function parseNumbers(text) {
   let best = null;
   (function walk(i, nums, cost) {
     if (i === segs.length) {
-      const call = nums.length === 3 ? 10 + (nums[2] === 1 || nums[2] === 2 ? 3 : 0) : 0;
-      const score = call - cost;
+      const score = 13 * completeCalls(nums) - cost;
       if (!best || score > best.score) best = { score, nums };
       return;
     }
@@ -226,6 +240,9 @@ function startRow() {
 // Each recognised phrase is one score call. A full call always starts a fresh row, so one
 // missed or extra number never shifts the rows after it. A short fragment heard right after
 // an unfinished row (e.g. "four two" ... "one") completes that row.
+// The third place only takes a 1 or 2 (the server number). Any other number there either
+// starts the next call, when more numbers follow it in the same phrase ("4 2 5 3 2" -> 4-2,
+// 5-3-2), or is dropped as a mishearing when it is the last thing heard ("4 2 5" -> 4-2).
 let lastHeard = 0;
 function handleNumbers(list) {
   if (!list.length) return;
@@ -234,9 +251,14 @@ function handleNumbers(list) {
   let shifted = false;
   const finishRow = current.length > 0 && current.length < P &&
     current.length + list.length <= P && now - lastHeard < CONFIG.continueMs;
-  if (!finishRow) { startRow(); shifted = true; }
-  for (const n of list) {
-    if (current.length >= P) { startRow(); shifted = true; }
+  let open = finishRow;    // is the bottom row still taking numbers from this phrase?
+  for (let i = 0; i < list.length; i++) {
+    const n = list[i];
+    if (open && current.length === P - 1 && !isServer(n)) {
+      if (i === list.length - 1) break;   // stray last number: drop it
+      open = false;                       // the call ended at two numbers; n starts the next
+    }
+    if (!open || current.length >= P) { startRow(); shifted = true; open = true; }
     current.push(n);
     renderRow(rows[rows.length - 1], current);
   }
