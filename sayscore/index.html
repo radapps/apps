@@ -68,74 +68,92 @@
 
 // ---------------------------------------------------------------- settings
 const CONFIG = {
-  perRow: 3,          // numbers per row
+  perRow: 3,          // numbers per row (pickleball doubles call: server score, receiver score, server #)
   rows: 3,            // rows on screen
+  maxNumber: 30,      // no single number is ever above this
+  continueMs: 4000,   // a fragment heard within this time finishes an unfinished row
   lang: 'en-US',
-  // On-device engine (used when the browser has no built-in speech recognition).
+  // On-device recogniser (the default). Add ?engine=web to the address to use the browser's own instead.
   voskLib: ['https://cdn.jsdelivr.net/npm/vosk-browser@0.0.8/dist/vosk.js', 'vosk.js'],
-  modelFile: 'vosk-model-small-en-us-0.15.tar.gz',   // optional copy next to this page
+  modelFile: 'sayscore-model.tar.gz',   // optional trimmed model next to this page (26 MB)
   modelFallback: 'https://ccoreilly.github.io/vosk-browser/models/vosk-model-small-en-us-0.15.tar.gz',
   pauseSplit: 0.1,    // seconds of silence between words that starts a new number
 };
 const SIZES = [9.5, 12.5, 20];  // font size in vmin: top, middle, main
 const MAXW  = [74, 84, 90];     // widest a row may be in vmin before it is scaled down
 
-const NUMBER_WORDS = ('zero one two three four five six seven eight nine ten eleven twelve thirteen ' +
-  'fourteen fifteen sixteen seventeen eighteen nineteen twenty thirty forty fifty sixty seventy ' +
-  'eighty ninety hundred thousand').split(' ');
-const GRAMMAR = JSON.stringify(NUMBER_WORDS.concat('[unk]'));
-
-// ---------------------------------------------------------------- number parsing
-const UNITS = { zero: 0, one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8, nine: 9 };
-const TEENS = { ten: 10, eleven: 11, twelve: 12, thirteen: 13, fourteen: 14, fifteen: 15,
-                sixteen: 16, seventeen: 17, eighteen: 18, nineteen: 19 };
-const TENS  = { twenty: 20, thirty: 30, forty: 40, fourty: 40, fifty: 50, sixty: 60,
-                seventy: 70, eighty: 80, ninety: 90 };
-// Words speech engines commonly return in place of a lone digit.
+// The only words the on-device recogniser listens for. "start" as in "zero zero start".
+const WORD_VALUE = { zero: 0, one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8,
+  nine: 9, ten: 10, eleven: 11, twelve: 12, thirteen: 13, fourteen: 14, fifteen: 15, sixteen: 16,
+  seventeen: 17, eighteen: 18, nineteen: 19, twenty: 20, thirty: 30, start: 2 };
+const GRAMMAR = JSON.stringify(Object.keys(WORD_VALUE).concat('[unk]'));
+// Words the browser's recogniser sometimes writes for a lone number.
 const ALIAS = { to: 'two', too: 'two', for: 'four', won: 'one', ate: 'eight', nought: 'zero' };
 
-// "five twelve seven" -> [5, 12, 7]; "twenty five" -> [25]; "one hundred and six" -> [106];
-// "5:12 7" -> [5, 12, 7]. Anything that is not a number word acts as a separator.
-function parseNumbers(text) {
+// ---------------------------------------------------------------- number parsing
+// Every way to read a digit string as numbers 0..maxNumber: "112" -> [11,2] [1,12] [1,1,2];
+// "002" -> [0,0,2]. (Google's recogniser writes "one one two" as 112.)
+function digitSplits(d) {
+  const maxLen = String(CONFIG.maxNumber).length;
+  if (d.length > 9) return [d.split('').map(Number)];
   const out = [];
-  const s = String(text || '').toLowerCase().replace(/(\d),(?=\d{3}(\D|$))/g, '$1');
-  const tokens = s.match(/\d+|[a-z]+|[,.;:!?]/g) || [];  // punctuation = a pause = separator
-  let cur = null; // { total, group, last }
-  const flush = () => { if (cur) { out.push(cur.total + cur.group); cur = null; } };
-  const start = (group, last, total) => { flush(); cur = { total: total || 0, group, last }; };
-  for (let t of tokens) {
-    if (/^\d/.test(t)) { flush(); out.push(parseInt(t, 10)); continue; }
-    t = ALIAS[t] || t;
-    const afterScale = cur && (cur.last === 'hundred' || cur.last === 'thousand');
-    if (t in UNITS) {
-      const v = UNITS[t];
-      if (v && cur && cur.last === 'tens') { cur.group += v; cur.last = 'unit'; cur.tensUnit = true; }  // twenty five
-      else if (v && afterScale) { cur.group += v; cur.last = 'unit'; }                                    // hundred (and) six
-      else start(v, 'unit');
-    } else if (t in TEENS) {
-      if (afterScale) { cur.group += TEENS[t]; cur.last = 'teen'; } else start(TEENS[t], 'teen');
-    } else if (t in TENS) {
-      if (afterScale) { cur.group += TENS[t]; cur.last = 'tens'; } else start(TENS[t], 'tens');
-    } else if (t === 'hundred') {
-      if (cur && cur.last === 'unit' && cur.tensUnit) {
-        // "sixty one hundred twenty" in a list is 60, 120 rather than 6,120
-        const unit = cur.group % 10;
-        cur.group -= unit; flush(); start(unit * 100, 'hundred');
-      } else if (cur && cur.last !== 'hundred' && cur.group > 0 && cur.group < 100) {
-        cur.group *= 100; cur.last = 'hundred';
-      } else start(100, 'hundred');
-    } else if (t === 'thousand') {
-      if (cur && cur.last !== 'thousand' && cur.total === 0 && cur.group > 0) {
-        cur.total = cur.group * 1000; cur.group = 0; cur.last = 'thousand';
-      } else start(0, 'thousand', 1000);
-    } else if (t === 'and' && afterScale) {
-      // "one hundred and six": keep building the same number
-    } else {
-      flush();
+  (function walk(i, acc) {
+    if (i === d.length) { out.push(acc); return; }
+    for (let len = Math.min(maxLen, d.length - i); len >= 1; len--) {
+      const part = d.substr(i, len);
+      if (len > 1 && part[0] === '0') continue;
+      if (+part > CONFIG.maxNumber) continue;
+      walk(i + len, acc.concat(+part));
     }
+  })(0, []);
+  return out.length ? out : [d.split('').map(Number)];
+}
+
+// Turns one recognised phrase into numbers. Where a phrase can be read more than one way
+// ("twenty five two" = 25,2 or 20,5,2; "112" = 11,2 or 1,1,2), it picks the reading that is a
+// complete score call (three numbers ending in server 1 or 2), otherwise the plainest reading.
+function parseNumbers(text) {
+  const s = String(text || '').toLowerCase();
+  const tokens = s.match(/\d+|[a-z]+|[,.;:!?]/g) || [];   // punctuation = a pause = separator
+  const segs = [];   // each segment: list of alternative readings { nums, cost }
+  let tensAt = -1;   // index of a lone "twenty" that the next word may complete
+  for (let t of tokens) {
+    if (/^\d/.test(t)) {
+      tensAt = -1;
+      const v = parseInt(t, 10);
+      if (t.length === 1) segs.push([{ nums: [v], cost: 0 }]);
+      else if (t[0] !== '0' && v <= CONFIG.maxNumber) {
+        segs.push([{ nums: [v], cost: 0 }, { nums: t.split('').map(Number), cost: 1 }]);
+      } else segs.push(digitSplits(t).map((nums) => ({ nums, cost: 0 })));
+      continue;
+    }
+    t = ALIAS[t] || t;
+    if (!(t in WORD_VALUE)) { tensAt = -1; continue; }   // not a number word: separator
+    const v = WORD_VALUE[t];
+    if (tensAt >= 0 && v >= 1 && v <= 9 && segs[tensAt].tens + v <= CONFIG.maxNumber) {
+      const tens = segs[tensAt].tens;
+      segs[tensAt] = [{ nums: [tens + v], cost: 0 }, { nums: [tens, v], cost: 1 }];
+      tensAt = -1;
+      continue;
+    }
+    const seg = [{ nums: [v], cost: 0 }];
+    segs.push(seg);
+    tensAt = -1;
+    if (t === 'twenty' || t === 'thirty') { seg.tens = v; tensAt = segs.length - 1; }
   }
-  flush();
-  return out;
+  const combos = segs.reduce((p, sg) => p * sg.length, 1);
+  if (combos > 512) return segs.flatMap((sg) => sg[0].nums);
+  let best = null;
+  (function walk(i, nums, cost) {
+    if (i === segs.length) {
+      const call = nums.length === 3 ? 10 + (nums[2] === 1 || nums[2] === 2 ? 3 : 0) : 0;
+      const score = call - cost;
+      if (!best || score > best.score) best = { score, nums };
+      return;
+    }
+    for (const alt of segs[i]) walk(i + 1, nums.concat(alt.nums), cost + alt.cost);
+  })(0, [], 0);
+  return best ? best.nums : [];
 }
 
 // ---------------------------------------------------------------- display
@@ -181,29 +199,42 @@ function layout(shifted) {
   });
 }
 
-function addNumber(n) {
-  const shift = !rows.length || current.length >= CONFIG.perRow;
-  if (shift) {
-    current = [];
-    const el = document.createElement('div');
-    el.className = 'row l' + (SIZES.length - 1);
-    el.style.fontSize = '0px';
-    rowsEl.appendChild(el);
-    rows.push(el);
-    if (rows.length > CONFIG.rows) {
-      const old = rows.shift();
-      old.classList.add('gone');
-      old.style.fontSize = '0px';
-      setTimeout(() => old.remove(), 400);
-    }
-    void el.offsetWidth; // let the new row grow from 0
+function startRow() {
+  current = [];
+  const el = document.createElement('div');
+  el.className = 'row l' + (SIZES.length - 1);
+  el.style.fontSize = '0px';
+  rowsEl.appendChild(el);
+  rows.push(el);
+  if (rows.length > CONFIG.rows) {
+    const old = rows.shift();
+    old.classList.add('gone');
+    old.style.fontSize = '0px';
+    setTimeout(() => old.remove(), 400);
   }
-  current.push(n);
-  renderRow(rows[rows.length - 1], current);
-  layout(shift);
+  void el.offsetWidth; // let the new row grow from 0
 }
 
-function handleNumbers(list) { list.forEach(addNumber); }
+// Each recognised phrase is one score call. A full call always starts a fresh row, so one
+// missed or extra number never shifts the rows after it. A short fragment heard right after
+// an unfinished row (e.g. "four two" ... "one") completes that row.
+let lastHeard = 0;
+function handleNumbers(list) {
+  if (!list.length) return;
+  const now = Date.now();
+  const P = CONFIG.perRow;
+  let shifted = false;
+  const finishRow = current.length > 0 && current.length < P &&
+    current.length + list.length <= P && now - lastHeard < CONFIG.continueMs;
+  if (!finishRow) { startRow(); shifted = true; }
+  for (const n of list) {
+    if (current.length >= P) { startRow(); shifted = true; }
+    current.push(n);
+    renderRow(rows[rows.length - 1], current);
+  }
+  lastHeard = now;
+  layout(shifted);
+}
 
 window.addEventListener('resize', () => layout(false));
 
@@ -262,20 +293,16 @@ const wake = (() => {
 const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
 let running = false;
 let session = 0;   // bumps on every start/stop so stale async work can bail out
-
-function pickEngine() {
-  const q = new URLSearchParams(location.search).get('engine');
-  if (q === 'web' || q === 'vosk') return q;
-  if (lsGet('numbers.engine') === 'vosk') return 'vosk';
-  return SR ? 'web' : 'vosk';
-}
+let tried = {};    // engines already tried in this session
 
 function start() {
   running = true;
   const my = ++session;
+  tried = {};
   setStatus('');
   wake.on();
-  if (pickEngine() === 'web') startWeb(my); else startVosk(my);
+  const wantWeb = new URLSearchParams(location.search).get('engine') === 'web';
+  if (wantWeb && SR) startWeb(my); else startVosk(my);
 }
 
 function stop(message) {
@@ -294,11 +321,12 @@ document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'visible' && audio && audio.ctx.state === 'suspended') audio.ctx.resume().catch(() => {});
 });
 
-// ---------------------------------------------------------------- engine 1: browser speech recognition
+// ---------------------------------------------------------------- engine: browser speech recognition (?engine=web)
 let rec = null;
 let quickEnds = 0;
 
 function startWeb(my) {
+  tried.web = true;
   setBtn('stop', 'Stop');
   const r = new SR();
   rec = r;
@@ -320,22 +348,19 @@ function startWeb(my) {
   r.onerror = (e) => {
     if (my !== session || rec !== r) return;
     if (e.error === 'no-speech' || e.error === 'aborted') return;
-    // network / service-not-allowed / language-not-supported / audio-capture: the browser's
-    // recogniser can't work here, so use the on-device one (it reports a missing mic itself).
-    // not-allowed may just be a denied prompt, so don't remember that one.
-    fallbackToVosk(my, e.error !== 'not-allowed');
+    fallbackToVosk(my);   // the browser's recogniser can't work here
   };
   r.onend = () => {
     if (my !== session || rec !== r) return;
-    if (!heard && Date.now() - began < 1500 && ++quickEnds >= 4) { fallbackToVosk(my, true); return; }
+    if (!heard && Date.now() - began < 1500 && ++quickEnds >= 4) { fallbackToVosk(my); return; }
     setTimeout(() => {
       if (my !== session || rec !== r) return;
       began = Date.now(); heard = false; done.clear();
-      try { r.start(); } catch (err) { fallbackToVosk(my, true); }
+      try { r.start(); } catch (err) { fallbackToVosk(my); }
     }, 250);
   };
   began = Date.now();
-  try { r.start(); } catch (err) { fallbackToVosk(my, true); }
+  try { r.start(); } catch (err) { fallbackToVosk(my); }
 }
 
 function stopWeb() {
@@ -345,10 +370,10 @@ function stopWeb() {
   try { r.abort(); } catch (e) {}
 }
 
-function fallbackToVosk(my, remember) {
+function fallbackToVosk(my) {
   if (my !== session) return;
   stopWeb();
-  if (remember) lsSet('numbers.engine', 'vosk');
+  if (tried.vosk) { stop('Speech not available here'); return; }
   startVosk(my);
 }
 
@@ -423,9 +448,10 @@ function errorMessage(err) {
 }
 
 async function startVosk(my) {
+  tried.vosk = true;
   setBtn('busy', 'Loading');
   const t0 = Date.now();
-  if (!lsGet('numbers.model')) setStatus('First run: ~40 MB download');
+  if (!lsGet('numbers.model')) setStatus('First run: downloading model');
   const tick = setInterval(() => {
     if (my === session && !audio) btn.textContent = 'Loading ' + Math.round((Date.now() - t0) / 1000) + 's';
   }, 1000);
@@ -459,7 +485,10 @@ async function startVosk(my) {
     setBtn('stop', 'Stop');
     setStatus('');
   } catch (err) {
-    if (my === session) stop(errorMessage(err));
+    if (my !== session) return;
+    const engineProblem = err && (err.message === 'lib' || err.message === 'model' || err.message === 'nomic');
+    if (engineProblem && SR && !tried.web) { setStatus(''); startWeb(my); return; }  // last resort
+    stop(errorMessage(err));
   } finally {
     clearInterval(tick);
   }
@@ -477,7 +506,7 @@ function stopVosk() {
 }
 
 // For testing in a desktop browser console.
-window.numbersApp = { parseNumbers, addNumber, numbersFromVosk };
+window.numbersApp = { parseNumbers, handleNumbers, numbersFromVosk };
 })();
 </script>
 </body>
