@@ -75,7 +75,8 @@ const CONFIG = {
   lang: 'en-US',
   // On-device recogniser (the default). Add ?engine=web to the address to use the browser's own instead.
   voskLib: ['https://cdn.jsdelivr.net/npm/vosk-browser@0.0.8/dist/vosk.js', 'vosk.js'],
-  modelFile: 'sayscore-model.tar.gz',   // optional trimmed model next to this page (26 MB)
+  modelFile: 'sayscore-model.tar.gz',   // optional trimmed model next to this page (26 MB)...
+  modelParts: ['sayscore-model.part1', 'sayscore-model.part2'],  // ...or the same split in two
   modelFallback: 'https://ccoreilly.github.io/vosk-browser/models/vosk-model-small-en-us-0.15.tar.gz',
   pauseSplit: 0.1,    // seconds of silence between words that starts a new number
 };
@@ -373,7 +374,7 @@ function stopWeb() {
 function fallbackToVosk(my) {
   if (my !== session) return;
   stopWeb();
-  if (tried.vosk) { stop('Speech not available here'); return; }
+  if (tried.vosk) { stop(tried.voskError || 'Speech not available here'); return; }
   startVosk(my);
 }
 
@@ -398,25 +399,93 @@ async function loadVoskLib() {
   throw new Error('lib');
 }
 
-async function modelUrl() {
-  // Must be absolute: the library resolves relative URLs against its worker, not this page.
-  const local = new URL(CONFIG.modelFile, location.href).href;
-  try { const r = await fetch(local, { method: 'HEAD', cache: 'no-store' }); if (r.ok) return local; } catch (e) {}
-  return CONFIG.modelFallback;
+// Where to get the model: the trimmed model split in two parts next to this page (each part is
+// small enough for GitHub's web uploader), a single local file, or the full hosted model.
+async function modelSource() {
+  const abs = (f) => new URL(f, location.href).href;  // absolute: the library resolves URLs from its worker
+  const exists = async (u) => {
+    try { const r = await fetch(u, { method: 'HEAD', cache: 'no-store' }); return r.ok; } catch (e) { return false; }
+  };
+  if (await exists(abs(CONFIG.modelParts[0]))) return { url: abs(CONFIG.modelFile), parts: CONFIG.modelParts.map(abs) };
+  if (await exists(abs(CONFIG.modelFile))) return { url: abs(CONFIG.modelFile), parts: null };
+  return { url: CONFIG.modelFallback, parts: null };
 }
+
+// Runs inside the library's worker before its own code. It reports download progress, joins
+// the split model parts into one download, and passes on errors the library would swallow.
+function workerPrelude(src) {
+  const realFetch = self.fetch.bind(self);
+  self.addEventListener('unhandledrejection', (e) => {
+    self.postMessage({ event: 'error', error: 'worker: ' + (e.reason && e.reason.message || e.reason) });
+  });
+  self.fetch = async function (input, init) {
+    const url = typeof input === 'string' ? input : (input && input.url) || '';
+    if (!/\.tar\.gz$/.test(url)) return realFetch(input, init);
+    const urls = url === src.url && src.parts ? src.parts : [url];
+    const resps = [];
+    let total = 0, loaded = 0, last = 0;
+    for (const u of urls) {
+      const r = await realFetch(u);
+      if (!r.ok) return r;
+      resps.push(r);
+      total += Number(r.headers.get('Content-Length')) || 0;
+    }
+    self.postMessage({ event: 'progress', loaded: 0, total });
+    const body = new ReadableStream({
+      async start(ctrl) {
+        try {
+          for (const r of resps) {
+            const reader = r.body.getReader();
+            for (;;) {
+              const { done, value } = await reader.read();
+              if (done) break;
+              loaded += value.length;
+              ctrl.enqueue(value);
+              const now = Date.now();
+              if (now - last > 500) { last = now; self.postMessage({ event: 'progress', loaded, total }); }
+            }
+          }
+          self.postMessage({ event: 'progress', loaded, total, done: true });
+          ctrl.close();
+        } catch (e) { ctrl.error(e); }
+      },
+    });
+    return new Response(body, { status: 200, headers: { 'Content-Type': 'application/gzip' } });
+  };
+}
+
+let loadStage = '', progress = null, stageAt = 0;
+function setStage(s) { loadStage = s; stageAt = Date.now(); }
 
 function getModel() {
   if (voskModel) return Promise.resolve(voskModel);
   if (!voskLoading) {
     voskLoading = (async () => {
+      setStage('engine');
       await loadVoskLib();
-      const url = await modelUrl();
+      const src = await modelSource();
+      setStage('model');
+      let crash;
+      const crashed = new Promise((resolve, reject) => { crash = reject; });
+      const RealWorker = window.Worker;
+      window.Worker = function (url, opts) {
+        const code = '(' + workerPrelude + ')(' + JSON.stringify(src) + ');\nimportScripts(' + JSON.stringify(url) + ');';
+        const w = new RealWorker(URL.createObjectURL(new Blob([code], { type: 'text/javascript' })), opts);
+        w.addEventListener('error', () => {
+          crash(new Error('crash'));
+          if (voskModel && audio) stop('Speech engine crashed');
+          voskModel = null;
+        });
+        return w;
+      };
+      let m;
+      try { m = new window.Vosk.Model(src.url, -1); } finally { window.Worker = RealWorker; }
+      m.on('progress', (p) => { progress = { loaded: p.loaded, total: p.total, done: !!p.done, at: Date.now() }; if (p.done) setStage('unpack'); else loadStage = 'download'; });
       // The model is downloaded once, then kept in the browser's storage (IndexedDB).
-      const m = new window.Vosk.Model(url, -1);  // -1: only log warnings/errors
-      await new Promise((resolve, reject) => {
+      await Promise.race([crashed, new Promise((resolve, reject) => {
         m.on('load', (msg) => (msg && msg.result ? resolve() : reject(new Error('model'))));
         m.on('error', () => reject(new Error('model')));
-      });
+      })]);
       voskModel = m;
       return m;
     })().catch((e) => { voskLoading = null; throw e; });
@@ -441,29 +510,59 @@ function errorMessage(err) {
   const name = err && err.name, msg = err && err.message;
   if (name === 'NotAllowedError' || name === 'SecurityError') return 'Microphone blocked';
   if (name === 'NotFoundError') return 'No microphone found';
+  if (msg === 'nomic') return 'This browser can’t use the mic';
   if (msg === 'lib') return 'Could not load speech engine';
   if (msg === 'model') return 'Speech model failed to load';
-  if (!navigator.mediaDevices) return 'This browser can’t use the mic';
+  if (msg === 'crash') return 'Speech engine crashed';
   return 'Speech not available here';
+}
+
+const MB = (b) => (b / 1048576).toFixed(b < 10485760 ? 1 : 0);
+
+// What the status line says while loading, so a slow watch never just shows a counter.
+function loadingText() {
+  const since = (Date.now() - stageAt) / 1000;
+  switch (loadStage) {
+    case 'mic': return since > 15 ? 'No mic prompt? Browser may block it' : 'Allow the microphone';
+    case 'engine': return 'Loading speech engine';
+    case 'model': return lsGet('numbers.model') ? 'Loading model' : 'Starting download';
+    case 'download': {
+      if (!progress) return 'Downloading model';
+      if (Date.now() - progress.at > 45000) return 'Download stalled – check Wi-Fi';
+      return 'Downloading ' + MB(progress.loaded) + (progress.total ? ' of ' + MB(progress.total) : '') + ' MB';
+    }
+    case 'unpack': return since > 90 ? 'Still unpacking…' : 'Unpacking model';
+    default: return '';
+  }
 }
 
 async function startVosk(my) {
   tried.vosk = true;
   setBtn('busy', 'Loading');
   const t0 = Date.now();
-  if (!lsGet('numbers.model')) setStatus('First run: downloading model');
-  const tick = setInterval(() => {
-    if (my === session && !audio) btn.textContent = 'Loading ' + Math.round((Date.now() - t0) / 1000) + 's';
-  }, 1000);
+  setStage('mic');
+  const tick = () => {
+    if (my !== session || audio) return;
+    btn.textContent = 'Loading ' + Math.round((Date.now() - t0) / 1000) + 's';
+    setStatus(loadingText());
+  };
+  tick();
+  const timer = setInterval(tick, 1000);
+  let stream = null;
+  const dropStream = () => { if (stream) stream.getTracks().forEach((t) => t.stop()); stream = null; };
   try {
-    const model = await getModel();
-    if (my !== session) return;
-    lsSet('numbers.model', '1');
+    // Ask for the mic first: if this browser can't give web pages the mic, say so before
+    // spending minutes downloading the model.
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) throw new Error('nomic');
-    const stream = await navigator.mediaDevices.getUserMedia({
+    stream = await navigator.mediaDevices.getUserMedia({
       audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 },
     });
-    if (my !== session) { stream.getTracks().forEach((t) => t.stop()); return; }
+    if (my !== session) { dropStream(); return; }
+    if (!voskModel) setStage('engine');
+    tick();
+    const model = await getModel();
+    if (my !== session) { dropStream(); return; }
+    lsSet('numbers.model', '1');
     let ctx, src;
     try {
       ctx = new AudioContext({ sampleRate: 16000 }); // model's native rate: less work on the watch
@@ -482,15 +581,19 @@ async function startVosk(my) {
     proc.connect(ctx.destination);
     if (ctx.state !== 'running') { try { await ctx.resume(); } catch (e) {} }
     audio = { ctx, stream, src, proc, recognizer };
+    stream = null;
+    setStage('');
     setBtn('stop', 'Stop');
     setStatus('');
   } catch (err) {
+    dropStream();
     if (my !== session) return;
-    const engineProblem = err && (err.message === 'lib' || err.message === 'model' || err.message === 'nomic');
+    const engineProblem = err && (err.message === 'lib' || err.message === 'model' || err.message === 'nomic' || err.message === 'crash');
+    tried.voskError = errorMessage(err);
     if (engineProblem && SR && !tried.web) { setStatus(''); startWeb(my); return; }  // last resort
     stop(errorMessage(err));
   } finally {
-    clearInterval(tick);
+    clearInterval(timer);
   }
 }
 
