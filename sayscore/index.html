@@ -48,7 +48,7 @@
     width: 46vmin; height: 17vmin; min-height: 40px; border: 0; border-radius: 999px;
     font: 700 7.5vmin/1 var(--font); letter-spacing: .02em; color: #000; background: #00c853; cursor: pointer;
   }
-  #btn.stop { background: #ff5252; }
+  #btn.stop { background: #5c1a1a; color: #ffcdd2; }   /* dark while listening: fewer lit pixels */
   #btn.busy { background: #3a3a3a; color: #fff; font-size: 6.2vmin; white-space: nowrap; }
   #btn:active { filter: brightness(.85); }
   #measure { position: absolute; left: -9999px; top: 0; visibility: hidden; white-space: nowrap; line-height: 1.08; }
@@ -84,6 +84,8 @@ const CONFIG = {
   // Slow devices (watches): above this CPU load the page stops sending silence to the
   // recogniser and asks for each result as soon as the speaker stops. ?gate=on / ?gate=off override.
   gateLoad: 0.4,
+  closeMargin: 12,    // dB: while gating, ignore sound this much quieter than the wearer's calls
+  maxBehind: 3,       // seconds: while gating, don't take new speech if the recogniser is this far behind
 };
 const PARAMS = new URLSearchParams(location.search);
 const DEBUG = PARAMS.has('debug');   // ?debug shows speed / lag figures at the top
@@ -601,35 +603,76 @@ function showDebug() {
   const behind = Math.max(0, dbg.sent - (dbg.heard - dbg.heardBase));
   el.textContent = 'CPU ' + Math.round(dbg.load * 100) + '%' +
     (dbg.gate ? ' · gate' + (dbg.open ? ' ●' : ' ○') : '') +
+    (voiceLevel() ? ' · you ' + Math.round(10 * Math.log10(voiceLevel())) + 'dB' : '') +
     (dbg.rate && dbg.rate !== 16000 ? ' · ' + Math.round(dbg.rate / 1000) + 'kHz' : '') + '\n' +
     'behind ' + behind.toFixed(1) + 's' +
     (dbg.lastDelay !== null ? ' · last ' + dbg.lastDelay.toFixed(1) + 's' : '');
 }
 setInterval(showDebug, 1000);
 
+// ---------------------------------------------------------------- "close-talk" mic
+// The wearer speaks from under a foot away, so their calls are far louder at the watch than
+// anyone else in the room. The page learns how loud the wearer's recognised calls are and,
+// while gating, ignores sound more than CONFIG.closeMargin dB quieter than that: in effect
+// the mic is turned down to the wearer's own voice. Learned levels are kept between visits.
+const voice = (() => {
+  let levels = [];
+  try { levels = JSON.parse(lsGet('numbers.voice') || '[]').filter((v) => v > 0).slice(-7); } catch (e) {}
+  return { levels, sinceCal: 0 };
+})();
+
+function voiceLevel() {
+  if (!voice.levels.length) return 0;
+  const s = voice.levels.slice().sort((a, b) => a - b);
+  return s[Math.floor(s.length / 2)];
+}
+
+// Threshold (signal power) below which sound is treated as "someone else". If no call has been
+// recognised for a while (e.g. the wearer is speaking more softly), it relaxes by 1 dB a minute.
+function closeThreshold() {
+  const v = voiceLevel();
+  if (!v) return 0;
+  const margin = CONFIG.closeMargin + Math.min(12, voice.sinceCal / 60);
+  return v * Math.pow(10, -margin / 10);
+}
+
+function learnVoice(level) {
+  if (!(level > 0)) return;
+  voice.levels.push(level);
+  voice.levels = voice.levels.slice(-7);
+  voice.sinceCal = 0;
+  lsSet('numbers.voice', JSON.stringify(voice.levels));
+}
+
 function wireAudio(ctx, recognizer) {
+  const rate = ctx.sampleRate;
   const SIZE = 2048;                                  // 128 ms per chunk at 16 kHz
-  const chunkSec = SIZE / ctx.sampleRate;
+  const chunkSec = SIZE / rate;
   const PRE = Math.ceil(0.35 / chunkSec);             // lead-in kept from before the speech
   const HANG = Math.ceil(0.6 / chunkSec);             // silence after speech before asking for the result
-  const MAXOPEN = Math.ceil(8 / chunkSec);            // never stay open longer than this
+  const MAXOPEN = Math.ceil(4 / chunkSec);            // a score call is ~2 s; longer sound is not one
+  const SLICE = Math.round(rate * 0.016);             // loudness is judged in 16 ms slices
+  const ABS_MIN = 1.6e-5;                             // ignore anything quieter than this (power)
   const proc = ctx.createScriptProcessor(SIZE, 1, 1);
   const pre = [];
-  let noise = 0, hang = 0, openFor = 0;
-  dbg.gate = gateWanted(); dbg.open = false; dbg.rate = ctx.sampleRate;
+  const sentLog = [];                                 // what was sent, with loudness, for learnVoice
+  let noise = 0, hang = 0, openFor = 0, streamSec = 0;
+  dbg.gate = gateWanted(); dbg.open = false; dbg.rate = rate;
   dbg.sent = 0; dbg.heardBase = dbg.heard; dbg.lastDelay = null; dbg.speechEndAt = 0;
-  const send = (x) => {
-    try { recognizer.acceptWaveformFloat(x, ctx.sampleRate); } catch (err) {}
-    dbg.sent += x.length / ctx.sampleRate;
+  const behind = () => Math.max(0, dbg.sent - (dbg.heard - dbg.heardBase));
+
+  const send = (c) => {
+    try { recognizer.acceptWaveformFloat(c.x, rate); } catch (err) {}
+    const dur = c.x.length / rate;
+    sentLog.push({ t0: streamSec, t1: streamSec + dur, powers: c.powers });
+    if (sentLog.length > 500) sentLog.shift();
+    streamSec += dur;
+    dbg.sent += dur;
   };
-  // Loudness is judged in 16 ms slices: speech stays loud for many slices in a row, while a
-  // paddle pop or a clap fills only one or two, so pops don't open the gate.
-  const SLICE = Math.round(ctx.sampleRate * 0.016);
-  const ABS_MIN = 4e-6;                                // ignore anything quieter than this (power)
+  const finish = () => { if (dbg.gate) { try { recognizer.retrieveFinalResult(); } catch (err) {} } };
+
   proc.onaudioprocess = (e) => {
     const x = new Float32Array(e.inputBuffer.getChannelData(0));   // copy: the browser may reuse it
-    // The speech detector always runs, so it is already tuned to the room if the gate switches
-    // on mid-session; with the gate off every chunk is still sent straight away.
     const gating = dbg.gate;
     const slices = Math.floor(x.length / SLICE);
     const powers = new Array(slices);
@@ -640,33 +683,58 @@ function wireAudio(ctx, recognizer) {
       powers[k] = s / SLICE;
       if (powers[k] < quietest) quietest = powers[k];
     }
+    const c = { x, powers };
     if (!noise) noise = Math.max(quietest, 1e-7);
-    const thr = Math.max(noise * (dbg.open ? 3 : 6), ABS_MIN);  // +5 dB to stay open, +8 dB to open
+    const close = gating ? closeThreshold() : 0;
+    const thr = dbg.open ? Math.max(noise * 3, ABS_MIN, close / 2)   // stay open: a bit more lenient
+                         : Math.max(noise * 6, ABS_MIN, close);       // open: needs a clear, close voice
     let loudSlices = 0;
     for (let k = 0; k < slices; k++) if (powers[k] > thr) loudSlices++;
-    const loud = loudSlices >= (dbg.open ? 2 : 4);              // 4 slices = 64 ms of sound to open
-    // Background level follows the quietest slice, which pops and voices barely touch.
+    const loud = loudSlices >= (dbg.open ? 2 : 4);              // 4 slices = 64 ms: pops don't count
     noise += (quietest - noise) * (quietest < noise ? 0.3 : (dbg.open ? 0.01 : 0.05));
+    voice.sinceCal += chunkSec;
+
     if (dbg.open) {
-      send(x);
+      send(c);
       openFor++;
-      if (loud) { hang = HANG; dbg.speechEndAt = performance.now(); }
+      if (loud && openFor <= MAXOPEN) { hang = HANG; dbg.speechEndAt = performance.now(); }
       else if (--hang <= 0 || openFor > MAXOPEN) {
+        if (openFor > MAXOPEN) {                                // constant din, not a call: tune it out
+          const s = powers.slice().sort((a, b) => a - b);
+          noise = Math.max(noise, s[Math.floor(s.length / 2)]);
+        }
         dbg.open = false;
-        if (gating) { try { recognizer.retrieveFinalResult(); } catch (err) {} }
+        finish();
       }
-    } else if (loud) {
+    } else if (loud && !(gating && behind() > CONFIG.maxBehind)) {
       dbg.open = true; hang = HANG; openFor = 0; dbg.speechEndAt = performance.now();
       pre.forEach(send); pre.length = 0;
-      send(x);
+      send(c);
     } else if (gating) {
-      pre.push(x);                      // hold back silence; keep a short lead-in
+      pre.push(c);                      // hold back silence; keep a short lead-in
       if (pre.length > PRE) pre.shift();
     } else {
-      send(x);
+      send(c);
     }
   };
-  return proc;
+
+  // Called with the words of a recognised call: measure how loud the wearer said them.
+  function heardCall(words) {
+    if (!Array.isArray(words)) return;
+    const ps = [];
+    for (const w of words) {
+      if (!(w.word in WORD_VALUE)) continue;
+      for (const s of sentLog) {
+        if (s.t1 <= w.start || s.t0 >= w.end) continue;
+        const d = (s.t1 - s.t0) / s.powers.length;
+        s.powers.forEach((p, k) => { const t = s.t0 + k * d; if (t >= w.start && t < w.end) ps.push(p); });
+      }
+    }
+    if (ps.length < 6) return;
+    ps.sort((a, b) => a - b);
+    learnVoice(ps[Math.floor(ps.length * 0.75)]);
+  }
+  return { proc, heardCall };
 }
 
 function errorMessage(err) {
@@ -719,7 +787,8 @@ async function startVosk(my) {
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) throw new Error('nomic');
     dbg.micAt = 0;
     stream = await navigator.mediaDevices.getUserMedia({
-      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 },
+      // No automatic gain: it would turn distant voices up toward the level of the wearer's.
+      audio: { echoCancellation: false, noiseSuppression: true, autoGainControl: false, channelCount: 1 },
     });
     dbg.micAt = performance.now();
     if (my !== session) { dropStream(); return; }
@@ -739,16 +808,19 @@ async function startVosk(my) {
     }
     const recognizer = new model.KaldiRecognizer(ctx.sampleRate, GRAMMAR);
     recognizer.setWords(true);
+    let wired = null;
     recognizer.on('result', (msg) => {
       const nums = numbersFromVosk(msg.result);
       if (nums.length) {
+        if (wired) wired.heardCall(msg.result && msg.result.result);
         dbg.lastResultAt = performance.now();
         dbg.log.push({ t: dbg.lastResultAt, nums });
         if (dbg.speechEndAt) dbg.lastDelay = (dbg.lastResultAt - dbg.speechEndAt) / 1000;
       }
       handleNumbers(nums);
     });
-    const proc = wireAudio(ctx, recognizer);
+    wired = wireAudio(ctx, recognizer);
+    const proc = wired.proc;
     src.connect(proc);
     proc.connect(ctx.destination);
     if (ctx.state !== 'running') { try { await ctx.resume(); } catch (e) {} }
@@ -781,7 +853,7 @@ function stopVosk() {
 }
 
 // For testing in a desktop browser console.
-window.numbersApp = { parseNumbers, handleNumbers, numbersFromVosk, dbg: () => dbg };
+window.numbersApp = { parseNumbers, handleNumbers, numbersFromVosk, dbg: () => dbg, voice: () => ({ levels: voice.levels, thr: closeThreshold() }) };
 })();
 </script>
 </body>
