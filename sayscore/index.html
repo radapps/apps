@@ -84,6 +84,9 @@ const CONFIG = {
   // Slow devices (watches): above this CPU load the page stops sending silence to the
   // recogniser and asks for each result as soon as the speaker stops. ?gate=on / ?gate=off override.
   gateLoad: 0.4,
+  // By default the screen sleeps as usual; the mic pauses while the page is off-screen and
+  // turns back on when it's showing again. ?awake keeps the screen on and always listening.
+  keepAwake: new URLSearchParams(location.search).has('awake'),
   closeMargin: 12,    // dB: while gating, ignore sound this much quieter than the wearer's calls
   maxBehind: 3,       // seconds: while gating, don't take new speech if the recogniser is this far behind
 };
@@ -95,10 +98,12 @@ const MAXW  = [74, 84, 90];     // widest a row may be in vmin before it is scal
 // The only words the on-device recogniser listens for. "start" as in "zero zero start".
 const WORD_VALUE = { zero: 0, one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8,
   nine: 9, ten: 10, eleven: 11, twelve: 12, thirteen: 13, fourteen: 14, fifteen: 15, sixteen: 16,
-  seventeen: 17, eighteen: 18, nineteen: 19, twenty: 20, thirty: 30, start: 2 };
+  seventeen: 17, eighteen: 18, nineteen: 19, twenty: 20, thirty: 30, start: 2, oh: 0 };
 const GRAMMAR = JSON.stringify(Object.keys(WORD_VALUE).concat('[unk]'));
 // Words the browser's recogniser sometimes writes for a lone number.
-const ALIAS = { to: 'two', too: 'two', for: 'four', won: 'one', ate: 'eight', nought: 'zero' };
+const ALIAS = { to: 'two', too: 'two', for: 'four', won: 'one', ate: 'eight', nought: 'zero', o: 'oh' };
+// Word IDs in the model's vocabulary, for words added after the trimmed model was published.
+const EXTRA_WORD_IDS = { oh: 5582 };
 
 // ---------------------------------------------------------------- number parsing
 // Every way to read a digit string as numbers 0..maxNumber: "112" -> [11,2] [1,12] [1,1,2];
@@ -137,14 +142,18 @@ function completeCalls(nums) {
 // Turns one recognised phrase into numbers. Where a phrase can be read more than one way
 // ("twenty five two" = 25,2 or 20,5,2; "112" = 11,2 or 1,1,2), it picks the reading that is a
 // complete score call (three numbers ending in server 1 or 2), otherwise the plainest reading.
+// "oh" counts as zero inside a call ("two oh two"), but players also say "oh!" after a miss: a
+// phrase that is only "oh" is ignored, and an "oh" that doesn't fit a call is treated as a word.
 function parseNumbers(text) {
   const s = String(text || '').toLowerCase();
   const tokens = s.match(/\d+|[a-z]+|[,.;:!?]/g) || [];   // punctuation = a pause = separator
   const segs = [];   // each segment: list of alternative readings { nums, cost }
   let tensAt = -1;   // index of a lone "twenty" that the next word may complete
+  let realNumber = false;   // heard something other than "oh"
   for (let t of tokens) {
     if (/^\d/.test(t)) {
       tensAt = -1;
+      realNumber = true;
       const v = parseInt(t, 10);
       if (t.length === 1) segs.push([{ nums: [v], cost: 0 }]);
       else if (t[0] !== '0' && v <= CONFIG.maxNumber) {
@@ -155,6 +164,8 @@ function parseNumbers(text) {
     t = ALIAS[t] || t;
     if (!(t in WORD_VALUE)) { tensAt = -1; continue; }   // not a number word: separator
     const v = WORD_VALUE[t];
+    if (t === 'oh') { segs.push([{ nums: [0], cost: 0 }, { nums: [], cost: 1 }]); tensAt = -1; continue; }
+    realNumber = true;
     if (tensAt >= 0 && v >= 1 && v <= 9 && segs[tensAt].tens + v <= CONFIG.maxNumber) {
       const tens = segs[tensAt].tens;
       segs[tensAt] = [{ nums: [tens + v], cost: 0 }, { nums: [tens, v], cost: 1 }];
@@ -166,12 +177,14 @@ function parseNumbers(text) {
     tensAt = -1;
     if (t === 'twenty' || t === 'thirty') { seg.tens = v; tensAt = segs.length - 1; }
   }
+  if (!realNumber) return [];
   const combos = segs.reduce((p, sg) => p * sg.length, 1);
   if (combos > 512) return segs.flatMap((sg) => sg[0].nums);
   let best = null;
   (function walk(i, nums, cost) {
     if (i === segs.length) {
-      const score = 13 * completeCalls(nums) - cost;
+      const full = completeCalls(nums);
+      const score = 13 * full - 2 * (nums.length - 3 * full) - cost;   // numbers left outside a call cost a little
       if (!best || score > best.score) best = { score, nums };
       return;
     }
@@ -251,8 +264,14 @@ function handleNumbers(list) {
   const now = Date.now();
   const P = CONFIG.perRow;
   let shifted = false;
-  const finishRow = current.length > 0 && current.length < P &&
+  let finishRow = current.length > 0 && current.length < P &&
     current.length + list.length <= P && now - lastHeard < CONFIG.continueMs;
+  // A fragment only finishes the unfinished row if the result is still a valid call.
+  const merged = current.concat(list);
+  if (finishRow && merged.length === P && !isServer(merged[P - 1])) {
+    if (current.length === P - 1 && list.length === 1) { lastHeard = now; return; }  // stray where the 1/2 belongs
+    finishRow = false;     // e.g. a stray "2" then "5 3": "5 3" is a new call, not 2-5-3
+  }
   let open = finishRow;    // is the bottom row still taking numbers from this phrase?
   for (let i = 0; i < list.length; i++) {
     const n = list[i];
@@ -326,19 +345,22 @@ const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
 let running = false;
 let session = 0;   // bumps on every start/stop so stale async work can bail out
 let tried = {};    // engines already tried in this session
+let paused = false; // listening, but the mic is off because the page is off-screen
 
 function start() {
   running = true;
   const my = ++session;
   tried = {};
   setStatus('');
-  wake.on();
+  paused = false;
+  if (CONFIG.keepAwake) wake.on();
   const wantWeb = new URLSearchParams(location.search).get('engine') === 'web';
   if (wantWeb && SR) startWeb(my); else startVosk(my);
 }
 
 function stop(message) {
   running = false;
+  paused = false;
   session++;
   stopWeb();
   stopVosk();
@@ -350,7 +372,13 @@ function stop(message) {
 btn.addEventListener('click', () => { if (running) stop(); else start(); });
 
 document.addEventListener('visibilitychange', () => {
-  if (document.visibilityState === 'visible' && audio && audio.ctx.state === 'suspended') audio.ctx.resume().catch(() => {});
+  const visible = document.visibilityState === 'visible';
+  if (!CONFIG.keepAwake && running && !rec) {
+    if (!visible && audio) { stopVosk(); paused = true; }          // screen off: release the mic
+    else if (visible && paused && !audio) { paused = false; startVosk(session, true); }  // back on
+    return;
+  }
+  if (visible && audio && audio.ctx.state === 'suspended') audio.ctx.resume().catch(() => {});
 });
 
 // ---------------------------------------------------------------- engine: browser speech recognition (?engine=web)
@@ -512,6 +540,45 @@ function workerPrelude(src) {
   };
 }
 
+// The library keeps the unpacked model in IndexedDB ("/vosk"). The trimmed model's word list
+// only has the words the page first used; append newer ones (e.g. "oh") to the stored copy so
+// the watch doesn't have to download the model again. Silently does nothing if not cached yet.
+function addCachedWords(modelUrl) {
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = () => { if (!done) { done = true; resolve(); } };
+    setTimeout(finish, 3000);
+    try {
+      const key = '/vosk/' + modelUrl.replace(/[\W]/g, '_') + '/graph/words.txt';
+      const req = indexedDB.open('/vosk');
+      req.onupgradeneeded = () => { try { req.transaction.abort(); } catch (e) {} };  // not created yet
+      req.onerror = finish;
+      req.onsuccess = () => {
+        const db = req.result;
+        try {
+          const tx = db.transaction('FILE_DATA', 'readwrite');
+          const store = tx.objectStore('FILE_DATA');
+          store.get(key).onsuccess = (e) => {
+            const entry = e.target.result;
+            if (!entry || !entry.contents) return;
+            let text = new TextDecoder().decode(entry.contents);
+            const missing = Object.keys(EXTRA_WORD_IDS).filter((w) => !new RegExp('^' + w + ' ', 'm').test(text));
+            if (!missing.length) return;
+            if (!text.endsWith('\n')) text += '\n';
+            text += missing.map((w) => w + ' ' + EXTRA_WORD_IDS[w]).join('\n') + '\n';
+            const bytes = new TextEncoder().encode(text);
+            entry.contents = new Int8Array(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+            entry.timestamp = new Date();
+            store.put(entry, key);
+          };
+          tx.oncomplete = () => { db.close(); finish(); };
+          tx.onerror = tx.onabort = () => { db.close(); finish(); };
+        } catch (err) { db.close(); finish(); }
+      };
+    } catch (err) { finish(); }
+  });
+}
+
 let loadStage = '', progress = null, stageAt = 0;
 function setStage(s) { loadStage = s; stageAt = Date.now(); }
 
@@ -537,6 +604,7 @@ function getModel() {
         });
         return w;
       };
+      await addCachedWords(src.url);
       let m;
       try { m = new window.Vosk.Model(src.url, -1); } finally { window.Worker = RealWorker; }
       m.on('perf', onPerf);
@@ -767,13 +835,13 @@ function loadingText() {
   }
 }
 
-async function startVosk(my) {
+async function startVosk(my, resuming) {
   tried.vosk = true;
-  setBtn('busy', 'Loading');
+  if (!resuming) setBtn('busy', 'Loading');
   const t0 = Date.now();
   setStage('mic');
   const tick = () => {
-    if (my !== session || audio) return;
+    if (my !== session || audio || resuming) return;
     btn.textContent = 'Loading ' + Math.round((Date.now() - t0) / 1000) + 's';
     setStatus(loadingText());
   };
@@ -829,6 +897,7 @@ async function startVosk(my) {
     setStage('');
     setBtn('stop', 'Stop');
     setStatus('');
+    if (!CONFIG.keepAwake && document.visibilityState === 'hidden') { stopVosk(); paused = true; }
   } catch (err) {
     dropStream();
     if (my !== session) return;
